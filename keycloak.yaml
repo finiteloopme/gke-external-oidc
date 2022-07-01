@@ -1,0 +1,63 @@
+# keycloak.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+  labels:
+    app: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      volumes:
+      - name: tls-config-volume
+        # secret:
+        #   secretName: tls-config
+        configMap:
+          name: tls-config
+          items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:18.0.1
+        # Start keycloak service in production for HTTPS
+        args: ["start"]
+        volumeMounts:
+        # Volume to hold the certificate to be used by Keycloak service
+        - name: tls-config-volume
+          mountPath: "/etc/x509/https"
+        env:
+        # Admin user configuration
+        - name: KEYCLOAK_ADMIN
+          value: "admin"
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          value: "admin"
+        # By defaulut production service expects a hostname.  Disable that config for K8S
+        - name: KC_HOSTNAME_STRICT
+          value: "false"
+        # Certificate info for TLS
+        - name: KC_HTTPS_CERTIFICATE_FILE
+          value: /etc/x509/https/tls.crt
+        - name: KC_HTTPS_CERTIFICATE_KEY_FILE
+          value: /etc/x509/https/tls.key
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: https
+          containerPort: 8443
+        readinessProbe:
+        # Note the scheme for HTTPS readiness probe
+          httpGet:
+            path: /realms/master
+            port: 8443
+            scheme: HTTPS

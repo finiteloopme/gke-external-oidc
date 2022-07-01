@@ -1,17 +1,41 @@
 # Overview
 
-GKE, integrates both [IAM][3] and [Kubernetes RBAC][4] to authorize users to perform actions if they have sufficient permissions according to either approaches.  Typically [Google Groups][5] are used to assign RBAC permissions to members.
-More often than not, these users already have a [Google Identity][1], which handles authentication.
-Though there are instances when developers may not have a [Google Identity][1].
+GKE, integrates both [IAM][3] and [Kubernetes RBAC][4] to authorize users to perform actions if they have sufficient permissions according to either approaches.  Typically [Google Groups][5] are used to assign RBAC permissions to members.  
+More often than not, these users already have a [Google Identity][1], which handles authentication. Though there are instances when developers may not have a [Google Identity][1].  
 These developers are typically from a third party organisation which doesn't use Google Identity.  GCP allows [use of external identity providers][6] to authenticate users for GKE.
 
 This writeup provides an [example][7] of configuring an external identity provider (Keycloak) to authenticate users into GKE.
 
-# Environment
+# Functional Components
+1. GKE Cluster
+2. Authentication Engine - Keycloak
+3. Developer Config for Login
+
+## GKE Cluster
+A Kubernetes cluster for use by external developers.
+### Initialise the environment
+```bash
+export PROJECT_ID=
+export GCP_REGION=us-central1
+export GCP_ZONE=${GCP_REGION}-b
+export GKE_CLUSTER_NAME=gke-ext-oidc
+gcloud config set project ${GCP_PROJECT}
+gcloud services enable container.googleapis.com \
+    privateca.googleapis.com
+```
+#### Create the cluster
+```bash
+gcloud container clusters create ${GKE_CLUSTER_NAME} \
+    --zone ${GCP_ZONE} 
+```
+
+## Authentication Engine - Keycloak
 We are using a self-hosted [Keycloak][8] instance on GKE as our authentication engine.  It allows all the basic user management functions and also federates identity with OAuth providers like [Github][9].
 
-## Keycloak Service
+> We are deploying this Keycloak instance in the same GKE cluster for simplicity
+### Keycloak Service
 ```yaml
+# keycloak-svc.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -36,7 +60,7 @@ spec:
     app: keycloak
   type: LoadBalancer
 ```
-Simple Kuberenetes Service, which exposes two endpoints.  
+A simple Kuberenetes Service, which exposes two endpoints.  
 1. HTTP on port 8080
 2. HTTPS on port 8443.  We will be using the `https` endpoint
 
@@ -46,9 +70,9 @@ kubectl create -f keycloak-svc.yaml
 export KEYCLOAK_SVC_IP=$(kubectl get services -n keycloak -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
 ```
 
-## Using self-signed certificates
-> Instead of self-signed certificates, consider using a proper CA like Google Cloud's [Certificate Authority Service][10]  
-> For example, check the `Makefile` targets: `create-pool`, `create-root-ca`, and `create-cert`
+### Using self-signed certificates
+> Consider using a proper CA like Google Cloud's [Certificate Authority Service][10] for prod environments.  
+> For example, check the [`Makefile`][11] targets: `create-pool`, `create-root-ca`, and `create-cert`
 
 ```bash
 openssl req -new -newkey rsa:4096 -x509 -sha256 -days 365 -nodes -subj \
@@ -58,14 +82,14 @@ openssl req -new -newkey rsa:4096 -x509 -sha256 -days 365 -nodes -subj \
 ```
 Using the certificate info in `tls.crt` and `tls.key`, create a config map which will be used by the keycloak applicaiton deployed on GKE.
 
-### ConfigMap with Certificate Info
-> Consider using `Secrets` instead of `ConfigMap`.  Using `ConfigMap` here for easier troubleshooting.
+#### ConfigMap with Certificate Info
+> For production, consider using `Secrets` instead of `ConfigMap`.  Using `ConfigMap` here for easier troubleshooting.
 ```bash
 kubectl create configmap tls-config -n keycloak --from-file=tls.crt --from-file=tls.key
 # kubectl create secret tls tls-secret --cert=tls.cert --key=tls.key
 ```
 
-## Deploy Keycloak App
+### Deploy Keycloak App
 ```yaml
 # keycloak.yaml
 apiVersion: apps/v1
@@ -135,6 +159,8 @@ spec:
 ```bash
 # deploy app
 kubectl create -f keycloak.yaml
+# Wait for a few minutes to access Admin Console.  Default username `admin` & password `admin`
+echo "Keycloak console: https://${KEYCLOAK_SVC_IP}:8443"
 ```
 
 # Initialise environment
@@ -169,3 +195,4 @@ create-app
 [8]: https://www.keycloak.org/
 [9]: https://github.com/settings/developers
 [10]: https://cloud.google.com/certificate-authority-service
+[11]: ./Makefile
