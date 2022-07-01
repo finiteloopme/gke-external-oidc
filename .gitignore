@@ -1,0 +1,5 @@
+.vscode
+gke-ext-oidc-vpc
+old
+tls.crt
+tls.key
