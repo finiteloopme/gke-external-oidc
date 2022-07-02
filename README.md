@@ -6,7 +6,7 @@ These developers are typically from a third party organisation which doesn't use
 
 This writeup provides an [example][7] of configuring an external identity provider (Keycloak) to authenticate users into GKE.
 
-# Functional Components
+# Functional Overview of various components
 1. GKE Cluster
 2. Authentication Engine - Keycloak
 3. Developer Config for Login
@@ -23,12 +23,15 @@ gcloud config set project ${GCP_PROJECT}
 gcloud services enable container.googleapis.com \
     privateca.googleapis.com
 ```
-#### Create the cluster
+#### Create the cluster with an Identity Service
 ```bash
 gcloud container clusters create ${GKE_CLUSTER_NAME} \
-    --zone ${GCP_ZONE} 
+    --zone ${GCP_ZONE} \
+    --enable-identity-service
 ```
-
+Identity Service for GKE creates a few Kubernetes objects in `anthos-identity-service` namespace.  Some of the important objects are:  
+1. **ClientConfig CRD**: used by cluster administrators to configure OIDC settings before distributing to developers.  It contains various configuration items like identity provider details, user & group claim mappings.
+2. `gke-oidc-service` **Deployment**: to validate identity tokens for ClientConfig resources.
 ## Authentication Engine - Keycloak
 We are using a self-hosted [Keycloak][8] instance on GKE as our authentication engine.  It allows all the basic user management functions and also federates identity with OAuth providers like [Github][9].
 
@@ -163,25 +166,144 @@ kubectl create -f keycloak.yaml
 echo "Keycloak console: https://${KEYCLOAK_SVC_IP}:8443"
 ```
 
-# Initialise environment
+### Configure Keycloak to Authenticate Developers  
+> These steps should be performed by the Administrator to onboard developers on GKE  
+1. Log in to the admin console `https://${KEYCLOAK_SVC_IP}:8443`
+2. Hover over `Master` realm on top left, and client `Create`
+3. Enter `gkeExtAuth` as the name the new realm & click `Create`
+4. In `gkeExtAuth`, `Realm Settings` >> `Tokens`, set `Access Token Lifespan` to `1 Hour`
+5. Using navigation on left, add `user`
+   - Username: testing
+   - Email: testing@testing.com
+   - First name: testing
+   - Last name: testing
+   - Set user enabled and email verified to: `True`
+   - Click `Save`
+   - Under credentials tab:
+      - Set & confirm password
+      - Set the `temporary` to: `OFF`
+      - Click `Set Password`
+     > Note the user ID for this user.
+     ```bash
+     export OIDC_USER_ID=<user ID value from the user list>
+     ```
+6. Using navigation on the left `Clients` >> `Create`
+   - Client ID: `client4gke`
+   - `Save`
+   - In `client4gke`:
+      - Access Type: `confidential`
+      - Valid Redirect URIs: `http://localhost:10000/callback`
+      - `Save`
+      - In the `Credentials` tab:
+         - Client Authenticator: `Client ID and Secret`
+         > Note the client ID and secret in an environment variable
+         ```bash
+         export OIDC_CLIENT_ID=<client ID from keycloak>
+         export OIDC_CLIENT_SECRET=<client secret from keycloak>
+         # also set the issue URI as https://${KEYCLOAK_SVC_IP}:8443/realms/<realm name from step 3>
+         export OIDC_ISSUER_URI=https://${KEYCLOAK_SVC_IP}:8443/realms/gkeExtAuth
+         ```
+
+### Enable OIDC
+1. Download the current `default` ClientConfig
+   ```bash
+   # Optional: simply to keep a copy of the original config
+   kubectl get clientconfig default -n kube-public -o yaml > client-config-original.yaml
+   ```
+2. Patch the `default` ClientConfig with our OIDC provider details:  
+   1. Configure the certificate info used by keycloak server
+      > We need to perform this step as we are using self-signed certificate
+      ```bash
+      export BASE64_CERT=$(openssl base64 -A -in tls.crt)
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/certificateAuthorityData", "value": "'${BASE64_CERT}'" }]'
+      ```
+   2. Set the client ID.  This is the client ID configured in the keycloak OIDC provider
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/clientID", "value": "'${OIDC_CLIENT_ID}'" }]'
+      ```
+   3. Set the `issuerURI`.  This issuer URI is the realm configured in keycloak OIDC.
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/issuerURI", "value": "'${OIDC_ISSUER_URI}'" }]'
+      ```
+   4. Set the `cloudConsoleRedirectURI` value.  This is a general constant used with GCP.
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/cloudConsoleRedirectURI", "value": "https://console.cloud.google.com/kubernetes/oidc" }]'
+   5. Set the `extraParams`:
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/extraParams", "value": "prompt=consent" }]'
+      ```
+   6. Set the `kubectlRedirectURI`.  This is the callback URL on localhost for OIDC provider to respond to the auth request.
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/kubectlRedirectURI", "value": "http://localhost:10000/callback" }]'
+      ```
+   7. Set the `scopes`.  Scopes requested from auth:
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/scopes", "value": "email, profile" }]'
+      ```
+   8. Set the `userClaim`.  Request the user ID from OIDC provider.
+      ```bash
+      kubectl patch clientconfig -n kube-public default --type=json -p='[{"op": "add", "path": "/spec/authentication/0/oidc/userClaim", "value": "sub" }]'
+      ```
+
+### Create a login file for developers
 ```bash
-make init
-# make create-pool
-make create-root-ca
-make get-creds
+kubectl get clientconfig default -n kube-public -o yaml > login-config.yaml
+yq '.spec.authentication[].oidc.clientSecret += "'${OIDC_CLIENT_SECRET}'"' login-config.yaml > dev-login-config.yaml
 ```
 
-# Setup Certificates
+## Create a RBAC Policy
+```yaml
+# secret-viewer-cluster-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-viewer
+rules:
+- apiGroups: [""]
+  # The resource type for which access is granted
+  resources: ["secrets"]
+  # The permissions granted by the ClusterRole
+  verbs: ["get", "watch", "list"]
+```
+Create the ClusterRole:
 ```bash
-make create-svc
-make create-cert
+kubectl apply -f secret-viewer-cluster-role.yaml
 ```
 
-# Deploy Keycloak App
+```yaml
+# secret-viewer-cluster-role-binding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name:  people-who-view-secrets
+subjects:
+- kind: User
+  name: ISSUER_URI#USER
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: secret-viewer
+  apiGroup: rbac.authorization.k8s.io
+```
+Create the ClusterRoleBinding:
 ```bash
-create-app
+sed -i "s|ISSUER_URI|${OIDC_ISSUER_URI}|g" secret-viewer-cluster-role-binding.yaml
+sed -i "s|USER|${OIDC_USER_ID}|g" secret-viewer-cluster-role-binding.yaml
+kubectl apply -f secret-viewer-cluster-role-binding.yaml
 ```
 
+## Login as a developer
+```bash
+kubectl oidc login --cluster=GKE_CLUSTER_NAME --login-config=dev-login-config.yaml
+```
+> To authenticate the developer, follow the prompts in the web browser.  
+> When properly authenticated, developers should be able to view `secrets` but not be able to list the `pods`
+```bash
+# should work
+kubectl get secrets
+# should not work
+kubectl get pods 
+```
 
 
 ------

@@ -1,0 +1,22 @@
+apiVersion: authentication.gke.io/v2alpha1
+kind: ClientConfig
+metadata:
+  name: default
+  namespace: kube-public
+spec:
+  name: ${GKE_CLUSTER_NAME}
+  server: ${GKE_API_SERVER}
+  authentication:
+  - name: oidc
+    oidc:
+      clientID: ${OIDC_CLIENT_ID}
+      certificateAuthorityData: ${OIDC_PROVIDER_CERTIFICATE}
+      extraParams: ${OIDC_EXTRA_PARAMS}
+      issuerURI:  ${OIDC_ISSUER_URI}
+      cloudConsoleRedirectURI: https://console.cloud.google.com/kubernetes/oidc
+      kubectlRedirectURI: ${KUBECTL_REDIRECT_URL}
+      scopes: ${OIDC_SCOPES}
+      userClaim: ${OIDC_USER_CLAIMS}
+      groupsClaim: ${OIDC_GROUP_CLAIMS}
+      userPrefix: ${OIDC_USER_PREFIX}
+      groupPrefix: ${OIDC_GROUP_PREFIX}
